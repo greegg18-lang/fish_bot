@@ -141,7 +141,8 @@ def main_menu():
             [KeyboardButton(text="🧾 Чек"),        KeyboardButton(text="📤 Поставщик")],
             [KeyboardButton(text="📈 Итоги партии"), KeyboardButton(text="💰 Финансы")],
             [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📁 Экспорт")],
-            [KeyboardButton(text="🗄 Архив партии"), KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text="🗄 Архив партии"), KeyboardButton(text="💾 Бэкап базы")],
+            [KeyboardButton(text="⚙️ Настройки")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -216,6 +217,30 @@ def add_price_if_changed(product_id, price_sale, price_cost):
     conn.close()
     return True
 
+async def send_backup(chat_id: int, caption_prefix: str = ""):
+    """Отправляет файл fish.db в чат. Возвращает True при успехе."""
+    try:
+        with open(DB_PATH, "rb") as f:
+            data = f.read()
+        filename = f"fish_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db"
+        caption = (caption_prefix + "\n" if caption_prefix else "") + (
+            f"💾 Бэкап базы от {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+            f"Сохрани файл — это полная копия всех данных бота."
+        )
+        await bot.send_document(
+            chat_id=chat_id,
+            document=BufferedInputFile(data, filename=filename),
+            caption=caption,
+        )
+        return True
+    except Exception as e:
+        logging.error(f"Backup failed: {e}")
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ Не удалось отправить бэкап: {e}",
+        )
+        return False
+
 # ---------- СТАРТ ----------
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
@@ -275,6 +300,14 @@ async def btn_settings(message: Message, state: FSMContext):
     if not is_admin(message):
         return
     await message.answer("Настройки:", reply_markup=settings_menu())
+
+# ---------- БЭКАП ПО КНОПКЕ ----------
+@dp.message(F.text == "💾 Бэкап базы")
+async def btn_backup(message: Message):
+    if not is_admin(message):
+        return
+    await message.answer("Готовлю бэкап...")
+    await send_backup(message.chat.id)
 
 # ---------- ТОВАРЫ И КЛИЕНТЫ ----------
 @dp.message(F.text == "📦 Товары")
@@ -996,7 +1029,7 @@ async def stats_show(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text("\n".join(lines))
     await state.clear()
 
-# ---------- АРХИВ ПАРТИИ ----------
+# ---------- АРХИВ ПАРТИИ (с авто-бэкапом) ----------
 @dp.message(F.text == "🗄 Архив партии")
 async def btn_archive(message: Message, state: FSMContext):
     if not is_admin(message):
@@ -1006,7 +1039,10 @@ async def btn_archive(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="❌ Отмена",  callback_data="arch:no")],
     ])
     await state.set_state(ArchiveFSM.confirm)
-    await message.answer("Все открытые заказы в архив?", reply_markup=markup)
+    await message.answer(
+        "Все открытые заказы в архив?\nПосле архивации придёт файл базы.",
+        reply_markup=markup,
+    )
 
 @dp.callback_query(ArchiveFSM.confirm, F.data.startswith("arch:"))
 async def archive_confirm(cb: CallbackQuery, state: FSMContext):
@@ -1014,12 +1050,18 @@ async def archive_confirm(cb: CallbackQuery, state: FSMContext):
         await cb.message.edit_text("Отменено.")
         await state.clear()
         return
+
     conn = db()
+    cnt = conn.execute("SELECT COUNT(*) AS c FROM orders WHERE status='open'").fetchone()["c"]
     conn.execute("UPDATE orders SET status='archived', archived_at=? WHERE status='open'",
                  (datetime.now().isoformat(timespec="seconds"),))
     conn.commit()
     conn.close()
-    await cb.message.edit_text("Всё отправлено в архив.")
+
+    await cb.message.edit_text(
+        f"🗄 В архив отправлено заказов: {cnt}.\nГотовлю бэкап..."
+    )
+    await send_backup(cb.from_user.id, caption_prefix=f"Бэкап после архивации ({cnt} зак.)")
     await state.clear()
 
 # ---------- ЭКСПОРТ ----------

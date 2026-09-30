@@ -20,7 +20,7 @@ from aiohttp import web
 
 # ---------- НАСТРОЙКИ ----------
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-ADMIN_ID = 186453903 # ⚠️ ЗАМЕНИ НА СВОЙ ID
+ADMIN_ID = 186453903   # ⚠️ ЗАМЕНИ НА СВОЙ ID (186453903)
 DB_PATH = "fish.db"
 PORT = int(os.getenv("PORT", 8080))
 
@@ -695,6 +695,65 @@ async def reweigh_input(message: Message, state: FSMContext):
     await state.clear()
 
 # ---------- ЧЕК ----------
+@dp.message(F.text == "🧾 Чек")
+async def btn_check(message: Message, state: FSMContext):
+    if not is_admin(message):
+        return
+    rows = open_orders()
+    if not rows:
+        await message.answer("Нет открытых заказов.")
+        return
+    items = [(r["id"], f"№{r['id']} — {r['customer']}") for r in rows]
+    await state.set_state(CheckFSM.choosing)
+    await message.answer("Выбери заказ:", reply_markup=kb(items, "chk"))
+
+@dp.callback_query(CheckFSM.choosing, F.data.startswith("chk:"))
+async def check_choose(cb: CallbackQuery, state: FSMContext):
+    oid = int(cb.data.split(":")[1])
+    await _show_check(cb, oid)
+    await state.clear()
+
+async def _show_check(cb: CallbackQuery, oid: int):
+    conn = db()
+    order = conn.execute("""
+        SELECT o.id, o.created_at, c.name AS customer
+        FROM orders o JOIN customers c ON c.id = o.customer_id
+        WHERE o.id = ?
+    """, (oid,)).fetchone()
+    items = conn.execute("""
+        SELECT p.name, oi.qty_pcs, oi.weight_kg, oi.product_id
+        FROM order_items oi JOIN products p ON p.id = oi.product_id
+        WHERE oi.order_id = ?
+    """, (oid,)).fetchall()
+    lines = [f"Чек — заказ №{order['id']}", f"Клиент: {order['customer']}", ""]
+    total = 0.0
+    not_weighed = 0
+    for it in items:
+        if it["weight_kg"] is None:
+            not_weighed += 1
+            lines.append(f"• {it['name']}: {it['qty_pcs']} шт. — вес не введён")
+            continue
+        price = conn.execute("""
+            SELECT price_sale FROM product_prices
+            WHERE product_id = ? AND valid_from <= ?
+            ORDER BY valid_from DESC, id DESC LIMIT 1
+        """, (it["product_id"], order["created_at"])).fetchone()
+        ps = price["price_sale"] if price else 0
+        amount = round(it["weight_kg"] * ps, 2)
+        total += amount
+        lines.append(f"• {it['name']}: {it['qty_pcs']} шт., {it['weight_kg']} кг "
+                     f"× {ps} ₽ = {amount} ₽")
+    conn.close()
+    lines.append("")
+    lines.append(f"Итого: {round(total, 2)} ₽")
+    if not_weighed:
+        lines.append(f"\n⚠️ Не взвешено: {not_weighed}")
+    text = "\n".join(lines)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Готовый чек", callback_data=f"send:{oid}")],
+    ])
+    await cb.message.edit_text(text, reply_markup=markup)
+
 @dp.callback_query(F.data.startswith("send:"))
 async def check_send(cb: CallbackQuery):
     oid = int(cb.data.split(":")[1])

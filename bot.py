@@ -3,6 +3,7 @@ import csv
 import io
 import logging
 import os
+import shutil
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -89,13 +90,7 @@ class ReweighFSM(StatesGroup):
 class CheckFSM(StatesGroup):
     choosing = State()
 
-class DeleteFSM(StatesGroup):
-    choosing = State()
-
 class ArchiveFSM(StatesGroup):
-    confirm = State()
-
-class WipeFSM(StatesGroup):
     confirm = State()
 
 class StatsFSM(StatesGroup):
@@ -107,13 +102,6 @@ class FinanceFSM(StatesGroup):
 class PartyFSM(StatesGroup):
     choosing = State()
 
-class EditFSM(StatesGroup):
-    choosing_order = State()
-    choosing_action = State()
-    choosing_product = State()
-    choosing_item = State()
-    entering_qty = State()
-
 class AddProductFSM(StatesGroup):
     entering = State()
 
@@ -124,6 +112,16 @@ class EditProductFSM(StatesGroup):
     choosing = State()
     choosing_field = State()
     entering_value = State()
+
+class EditOrderFSM(StatesGroup):
+    choosing_product = State()
+    entering_qty_add = State()
+    entering_qty_set = State()
+    choosing_item_qty = State()
+    choosing_item_del = State()
+
+class ImportFSM(StatesGroup):
+    waiting_file = State()
 
 # ---------- БОТ ----------
 bot = Bot(token=TOKEN)
@@ -142,7 +140,7 @@ def main_menu():
             [KeyboardButton(text="📈 Итоги партии"), KeyboardButton(text="💰 Финансы")],
             [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📁 Экспорт")],
             [KeyboardButton(text="🗄 Архив партии"), KeyboardButton(text="💾 Бэкап базы")],
-            [KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text="📥 Импорт базы"),  KeyboardButton(text="⚙️ Настройки")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -218,7 +216,6 @@ def add_price_if_changed(product_id, price_sale, price_cost):
     return True
 
 async def send_backup(chat_id: int, caption_prefix: str = ""):
-    """Отправляет файл fish.db в чат. Возвращает True при успехе."""
     try:
         with open(DB_PATH, "rb") as f:
             data = f.read()
@@ -252,6 +249,11 @@ async def cmd_start(message: Message, state: FSMContext):
         "🐟 Бот учёта рыбы.\n\nПользуйся кнопками снизу.",
         reply_markup=main_menu(),
     )
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Отменено.", reply_markup=main_menu())
 
 @dp.message(Command("cleanprices"))
 async def cmd_cleanprices(message: Message):
@@ -301,13 +303,101 @@ async def btn_settings(message: Message, state: FSMContext):
         return
     await message.answer("Настройки:", reply_markup=settings_menu())
 
-# ---------- БЭКАП ПО КНОПКЕ ----------
+# ---------- БЭКАП ----------
 @dp.message(F.text == "💾 Бэкап базы")
 async def btn_backup(message: Message):
     if not is_admin(message):
         return
     await message.answer("Готовлю бэкап...")
     await send_backup(message.chat.id)
+
+# ---------- ИМПОРТ ----------
+@dp.message(F.text == "📥 Импорт базы")
+async def btn_import(message: Message, state: FSMContext):
+    if not is_admin(message):
+        return
+    await state.set_state(ImportFSM.waiting_file)
+    await message.answer(
+        "📥 Пришли файл бэкапа (`fish_backup_*.db`) документом.\n\n"
+        "⚠️ Текущая база будет заменена.\n"
+        "Если нужно — сначала сделай «💾 Бэкап базы».\n\n"
+        "Отмена — /cancel"
+    )
+
+@dp.message(ImportFSM.waiting_file, F.document)
+async def import_file(message: Message, state: FSMContext):
+    doc = message.document
+    if not doc.file_name.endswith(".db"):
+        await message.answer("Нужен файл с расширением `.db`.")
+        return
+
+    # 1) страховочная копия текущей базы
+    try:
+        if os.path.exists(DB_PATH):
+            shutil.copy(DB_PATH, DB_PATH + ".before_import")
+    except Exception as e:
+        logging.error(f"Страховочная копия не сделана: {e}")
+
+    # 2) скачиваем новый файл
+    file = await bot.get_file(doc.file_id)
+    tmp_path = "fish_import_tmp.db"
+    await bot.download_file(file.file_path, tmp_path)
+
+    # 3) проверяем структуру
+    try:
+        conn = sqlite3.connect(tmp_path)
+        conn.row_factory = sqlite3.Row
+        tables = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+        names = {t["name"] for t in tables}
+        required = {"products", "product_prices", "customers", "orders", "order_items"}
+        if not required.issubset(names):
+            conn.close()
+            os.remove(tmp_path)
+            await message.answer(
+                "⚠️ Файл не похож на базу бота — нет нужных таблиц.\n"
+                "Импорт отменён, текущая база не тронута."
+            )
+            await state.clear()
+            return
+        p_cnt = conn.execute("SELECT COUNT(*) AS c FROM products").fetchone()["c"]
+        c_cnt = conn.execute("SELECT COUNT(*) AS c FROM customers").fetchone()["c"]
+        o_cnt = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
+        conn.close()
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        await message.answer(f"⚠️ Ошибка чтения файла: {e}")
+        await state.clear()
+        return
+
+    # 4) подменяем базу
+    try:
+        shutil.move(tmp_path, DB_PATH)
+    except Exception as e:
+        await message.answer(f"⚠️ Не удалось заменить базу: {e}")
+        await state.clear()
+        return
+
+    await message.answer(
+        f"✅ База восстановлена!\n\n"
+        f"Товаров: {p_cnt}\n"
+        f"Клиентов: {c_cnt}\n"
+        f"Заказов (всего): {o_cnt}\n\n"
+        f"Перезапускаю бота через 3 секунды..."
+    )
+    await state.clear()
+    await asyncio.sleep(3)
+    os._exit(0)  # Render автоматически перезапустит сервис
+
+@dp.message(ImportFSM.waiting_file)
+async def import_wrong(message: Message, state: FSMContext):
+    if message.text and message.text.strip().lower() in ("/cancel", "отмена"):
+        await state.clear()
+        await message.answer("Импорт отменён.", reply_markup=main_menu())
+        return
+    await message.answer("Пришли файл `.db` документом или /cancel для отмены.")
 
 # ---------- ТОВАРЫ И КЛИЕНТЫ ----------
 @dp.message(F.text == "📦 Товары")
@@ -618,6 +708,117 @@ async def order_action(cb: CallbackQuery, state: FSMContext):
         conn.commit()
         conn.close()
         await cb.message.edit_text(f"Заказ №{oid} удалён.")
+
+# ---------- РЕДАКТИРОВАНИЕ ЗАКАЗА ----------
+@dp.callback_query(F.data.startswith("editact:"))
+async def editact(cb: CallbackQuery, state: FSMContext):
+    _, action, oid = cb.data.split(":")
+    oid = int(oid)
+
+    if action == "add":
+        rows = products_list()
+        if not rows:
+            await cb.message.edit_text("Нет товаров.")
+            return
+        items = []
+        for r in rows:
+            cur = get_current_prices(r["id"])
+            label = f"{r['name']} ({cur['price_sale']} ₽/кг)" if cur else r["name"]
+            items.append((r["id"], label))
+        await state.update_data(order_id=oid)
+        await state.set_state(EditOrderFSM.choosing_product)
+        await cb.message.edit_text("Выбери товар для добавления:",
+                                   reply_markup=kb(items, "eadd"))
+
+    elif action == "qty":
+        conn = db()
+        items_rows = conn.execute("""
+            SELECT oi.id, p.name, oi.qty_pcs
+            FROM order_items oi JOIN products p ON p.id = oi.product_id
+            WHERE oi.order_id = ?
+            ORDER BY oi.id
+        """, (oid,)).fetchall()
+        conn.close()
+        if not items_rows:
+            await cb.message.edit_text("В заказе нет позиций.")
+            return
+        items = [(r["id"], f"{r['name']} — {r['qty_pcs']} шт.") for r in items_rows]
+        await state.update_data(order_id=oid)
+        await state.set_state(EditOrderFSM.choosing_item_qty)
+        await cb.message.edit_text("Какую позицию изменить?",
+                                   reply_markup=kb(items, "eqty"))
+
+    elif action == "del":
+        conn = db()
+        items_rows = conn.execute("""
+            SELECT oi.id, p.name, oi.qty_pcs
+            FROM order_items oi JOIN products p ON p.id = oi.product_id
+            WHERE oi.order_id = ?
+            ORDER BY oi.id
+        """, (oid,)).fetchall()
+        conn.close()
+        if not items_rows:
+            await cb.message.edit_text("В заказе нет позиций.")
+            return
+        items = [(r["id"], f"{r['name']} — {r['qty_pcs']} шт.") for r in items_rows]
+        await state.update_data(order_id=oid)
+        await state.set_state(EditOrderFSM.choosing_item_del)
+        await cb.message.edit_text("Какую позицию удалить?",
+                                   reply_markup=kb(items, "edel"))
+
+@dp.callback_query(EditOrderFSM.choosing_product, F.data.startswith("eadd:"))
+async def eadd_product(cb: CallbackQuery, state: FSMContext):
+    pid = int(cb.data.split(":")[1])
+    await state.update_data(product_id=pid)
+    await cb.message.edit_text("Введи количество в штуках:")
+    await state.set_state(EditOrderFSM.entering_qty_add)
+
+@dp.message(EditOrderFSM.entering_qty_add)
+async def eadd_qty(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("Нужно целое число.")
+        return
+    data = await state.get_data()
+    conn = db()
+    conn.execute(
+        "INSERT INTO order_items (order_id, product_id, qty_pcs) VALUES (?, ?, ?)",
+        (data["order_id"], data["product_id"], int(message.text)),
+    )
+    conn.commit()
+    conn.close()
+    await message.answer(f"✅ Позиция добавлена в заказ №{data['order_id']}.")
+    await state.clear()
+
+@dp.callback_query(EditOrderFSM.choosing_item_qty, F.data.startswith("eqty:"))
+async def eqty_choose(cb: CallbackQuery, state: FSMContext):
+    item_id = int(cb.data.split(":")[1])
+    await state.update_data(item_id=item_id)
+    await cb.message.edit_text("Введи новое количество в штуках:")
+    await state.set_state(EditOrderFSM.entering_qty_set)
+
+@dp.message(EditOrderFSM.entering_qty_set)
+async def eqty_set(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("Нужно целое число.")
+        return
+    data = await state.get_data()
+    conn = db()
+    conn.execute("UPDATE order_items SET qty_pcs = ? WHERE id = ?",
+                 (int(message.text), data["item_id"]))
+    conn.commit()
+    conn.close()
+    await message.answer(f"✅ Количество обновлено: {message.text} шт.")
+    await state.clear()
+
+@dp.callback_query(EditOrderFSM.choosing_item_del, F.data.startswith("edel:"))
+async def edel_choose(cb: CallbackQuery, state: FSMContext):
+    item_id = int(cb.data.split(":")[1])
+    conn = db()
+    conn.execute("DELETE FROM order_items WHERE id = ?", (item_id,))
+    conn.commit()
+    conn.close()
+    await cb.message.edit_text("❌ Позиция удалена из заказа.")
+    await state.clear()
 
 # ---------- ВЗВЕШИВАНИЕ ----------
 @dp.message(F.text == "⚖️ Взвесить")

@@ -232,10 +232,8 @@ async def send_backup(chat_id: int, caption_prefix: str = ""):
         return True
     except Exception as e:
         logging.error(f"Backup failed: {e}")
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"⚠️ Не удалось отправить бэкап: {e}",
-        )
+        await bot.send_message(chat_id=chat_id,
+                               text=f"⚠️ Не удалось отправить бэкап: {e}")
         return False
 
 # ---------- СТАРТ ----------
@@ -331,12 +329,24 @@ async def import_file(message: Message, state: FSMContext):
         await message.answer("Нужен файл с расширением `.db`.")
         return
 
-    # 1) страховочная копия текущей базы
-    try:
-        if os.path.exists(DB_PATH):
+    # 1) страховочная копия текущей базы + отправляем её в чат
+    if os.path.exists(DB_PATH):
+        try:
             shutil.copy(DB_PATH, DB_PATH + ".before_import")
-    except Exception as e:
-        logging.error(f"Страховочная копия не сделана: {e}")
+            with open(DB_PATH, "rb") as f:
+                old_data = f.read()
+            if len(old_data) > 0:
+                await bot.send_document(
+                    chat_id=message.chat.id,
+                    document=BufferedInputFile(
+                        old_data,
+                        filename=f"fish_before_import_{datetime.now().strftime('%Y%m%d_%H%M')}.db",
+                    ),
+                    caption="🛟 Страховочная копия ТЕКУЩЕЙ базы (до импорта).\n"
+                            "Сохрани, если вдруг прислал не тот файл.",
+                )
+        except Exception as e:
+            logging.error(f"Страховочная копия не сделана: {e}")
 
     # 2) скачиваем новый файл
     file = await bot.get_file(doc.file_id)
@@ -364,6 +374,7 @@ async def import_file(message: Message, state: FSMContext):
         p_cnt = conn.execute("SELECT COUNT(*) AS c FROM products").fetchone()["c"]
         c_cnt = conn.execute("SELECT COUNT(*) AS c FROM customers").fetchone()["c"]
         o_cnt = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
+        oi_cnt = conn.execute("SELECT COUNT(*) AS c FROM order_items").fetchone()["c"]
         conn.close()
     except Exception as e:
         if os.path.exists(tmp_path):
@@ -372,9 +383,22 @@ async def import_file(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    # 4) подменяем базу
+    # 4) подменяем базу с принудительным сбросом на диск
     try:
+        # сброс буферов ОС
+        try:
+            os.sync()
+        except Exception:
+            pass
+        # удаляем старый файл явно, потом переносим новый
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
         shutil.move(tmp_path, DB_PATH)
+        # снова сброс, чтобы замена точно попала на диск
+        try:
+            os.sync()
+        except Exception:
+            pass
     except Exception as e:
         await message.answer(f"⚠️ Не удалось заменить базу: {e}")
         await state.clear()
@@ -384,12 +408,11 @@ async def import_file(message: Message, state: FSMContext):
         f"✅ База восстановлена!\n\n"
         f"Товаров: {p_cnt}\n"
         f"Клиентов: {c_cnt}\n"
-        f"Заказов (всего): {o_cnt}\n\n"
-        f"Перезапускаю бота через 3 секунды..."
+        f"Заказов (всего): {o_cnt}\n"
+        f"Позиций в заказах: {oi_cnt}\n\n"
+        f"Бот продолжает работу — можно пользоваться."
     )
     await state.clear()
-    await asyncio.sleep(3)
-    os._exit(0)  # Render автоматически перезапустит сервис
 
 @dp.message(ImportFSM.waiting_file)
 async def import_wrong(message: Message, state: FSMContext):
